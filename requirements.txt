@@ -1,5 +1,5 @@
-pyTelegramBotAPI==4.23.0
-yt-dlp
+yt-dlp[default]
 imageio-ffmpeg
 shazamio
 psycopg2-binary
+pyTelegramBotAPI
