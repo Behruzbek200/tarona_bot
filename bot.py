@@ -2295,10 +2295,12 @@ def safe_animate_progress(chat_id: int, msg_id: int, label: str, stop_event: thr
         idx += 1
 
 def download_file_turbo(url: str, base_path: str, mode: str = "audio"):
+    t0 = time.time()
     with DOWNLOAD_SEMAPHORE:
         ydl_opts = get_ydl_opts(mode=mode, outtmpl=f"{base_path}.%(ext)s")
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
+            print(f"⏱ {mode} yuklash: {time.time()-t0:.1f}s | {url}")
             if isinstance(info, dict) and "entries" in info and info["entries"]:
                 info = info["entries"][0]
             files = sorted(
@@ -2353,8 +2355,12 @@ def send_audio_by_url(
         return markup
 
     ev = PREFETCH_INFLIGHT.get(url)
-    if ev:
-        ev.wait(timeout=90)
+    if ev and not get_cached_media(cache_id, custom_title or ""):
+        try:
+            bot.send_chat_action(chat_id, "upload_voice")
+        except Exception:
+            pass
+        ev.wait(timeout=45)
     cached = get_cached_media(cache_id, custom_title or "")
     if cached:
         file_id, _, title = cached
