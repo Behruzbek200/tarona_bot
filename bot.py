@@ -642,15 +642,33 @@ def background_supabase_sync_worker():
         flush_sync_queue_to_supabase()
 
 # ==========================================
-# 4. 0.1s TEZLIKLI YUKLASH SOZLAMALARI
+# 4. QIDIRUV VA YUKLASH SOZLAMALARI
 # ==========================================
 def get_ydl_opts(mode: str = "audio", outtmpl: str = None):
+    if mode == "search":
+        return {
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['web', 'mweb'],
+                }
+            },
+            'source_address': '0.0.0.0',
+            'noplaylist': True,
+            'quiet': True,
+            'no_warnings': True,
+            'nocheckcertificate': True,
+            'retries': 1,
+            'socket_timeout': 8,
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+            }
+        }
+
     opts = {
         'ffmpeg_location': FFMPEG_BIN,
         'extractor_args': {
             'youtube': {
                 'player_client': ['android', 'ios', 'web'],
-                'skip': ['dash', 'hls'] if mode == "audio" else []
             }
         },
         'source_address': '0.0.0.0',
@@ -661,13 +679,14 @@ def get_ydl_opts(mode: str = "audio", outtmpl: str = None):
         'retries': 1,
         'fragment_retries': 1,
         'socket_timeout': 8,
-        'concurrent_fragment_downloads': 12,
+        'concurrent_fragment_downloads': 16,
+        'http_chunk_size': 10 * 1024 * 1024,
         'http_headers': {
             'User-Agent': 'com.google.android.youtube/19.29.37 (Linux; U; Android 14) gzip',
         }
     }
     if mode == "audio":
-        opts['format'] = 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best'
+        opts['format'] = 'bestaudio[ext=m4a][abr<=130]/bestaudio[ext=m4a]/bestaudio/best'
     elif mode == "video":
         opts['format'] = 'best[height<=720][ext=mp4]/best[height<=720]/best'
     if outtmpl:
@@ -1727,7 +1746,7 @@ def get_admin_dashboard_text():
     st = get_detailed_stats()
     tag_txt = "Ko'rinadi (@bot)" if is_show_bot_tag() else "Yashirilgan"
     return (
-        f"👑 <b>Boshqaruv Paneli (Supabase + RAM 0.1s)</b>\n\n"
+        f"👑 <b>Boshqaruv Paneli (Supabase + RAM)</b>\n\n"
         f"👤 Shaxsiy: <b>{st['total_priv']}</b> (🟢 Faol: <b>{st['alive_priv']}</b> | 🔴 Chiqqan: <b>{st['left_priv']}</b>)\n"
         f"👥 Guruhlar: <b>{st['total_grp']}</b> (🟢 Faol: <b>{st['alive_grp']}</b> | 🔴 Chiqqan: <b>{st['left_grp']}</b>)\n"
         f"📈 Qo'shilgan: Bugun <b>+{st['joined_24h']}</b> | 7 kun <b>+{st['joined_7d']}</b> | 30 kun <b>+{st['joined_30d']}</b>\n"
@@ -2216,8 +2235,55 @@ def handle_admin_wizard(message: types.Message):
         )
 
 # ==========================================
-# 11. 0.1s KESH + YUKLASH + ZAXIRA MANBA
+# 11. KESH + OLDINDAN YUKLASH + ZAXIRA MANBA
 # ==========================================
+PREFETCH_INFLIGHT = {}
+PREFETCH_SEM = threading.Semaphore(4)
+
+def _prefetch_one(url: str, title: str = ""):
+    key = f"aud:{url}"
+    if get_cached_media(key, title):
+        return
+    with MEM_LOCK:
+        if url in PREFETCH_INFLIGHT:
+            return
+        ev = threading.Event()
+        PREFETCH_INFLIGHT[url] = ev
+    aud_file = None
+    try:
+        with PREFETCH_SEM:
+            base = f"downloads/pf_{int(time.time()*1000)}_{random.randint(100,999)}"
+            aud_file, dl_title, dur = download_file_turbo(url, base, mode="audio")
+            if aud_file and os.path.exists(aud_file):
+                with open(aud_file, "rb") as a:
+                    sent = bot.send_audio(
+                        SUPER_ADMIN_ID, a,
+                        title=title or dl_title,
+                        duration=int(dur) if dur else None,
+                        disable_notification=True
+                    )
+                if sent and sent.audio:
+                    save_cached_media(key, sent.audio.file_id, "audio", title or dl_title)
+                    try:
+                        bot.delete_message(SUPER_ADMIN_ID, sent.message_id)
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    finally:
+        if aud_file and os.path.exists(aud_file):
+            try:
+                os.remove(aud_file)
+            except Exception:
+                pass
+        with MEM_LOCK:
+            PREFETCH_INFLIGHT.pop(url, None)
+        ev.set()
+
+def prefetch_entries(entries, n: int = 3):
+    for it in entries[:n]:
+        threading.Thread(target=_prefetch_one, args=(it["url"], it.get("title", "")), daemon=True).start()
+
 def safe_animate_progress(chat_id: int, msg_id: int, label: str, stop_event: threading.Event):
     frames = [".", "..", "..."]
     idx = 0
@@ -2286,7 +2352,9 @@ def send_audio_by_url(
             markup.add(ad_btn)
         return markup
 
-    # 1. Keshda bo'lsa (~0.1s da darhol yuboradi)
+    ev = PREFETCH_INFLIGHT.get(url)
+    if ev:
+        ev.wait(timeout=90)
     cached = get_cached_media(cache_id, custom_title or "")
     if cached:
         file_id, _, title = cached
@@ -2541,7 +2609,9 @@ def _yt_flat_search(search_expr: str, filter_mixes: bool = False):
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         res = ydl.extract_info(search_expr, download=False)
         out = []
-        for e in res.get('entries', []):
+        for e in (res or {}).get('entries', []) or []:
+            if not isinstance(e, dict):
+                continue
             vid_id = e.get('id')
             url = e.get('url') or (f"https://www.youtube.com/watch?v={vid_id}" if vid_id else None)
             if url and not url.startswith("http"):
@@ -2659,6 +2729,7 @@ def handle_text_search(message: types.Message):
         SEARCH_CACHE[f"srch_{uid}"] = {'query': query, 'entries': entries, 'mode': 'search'}
         text, markup = build_search_page(uid, page=0)
         bot.reply_to(message, text, reply_markup=markup, parse_mode="HTML")
+        prefetch_entries(entries, 3)
     except Exception:
         bot.reply_to(message, t(uid, "search_err"), parse_mode="HTML")
 
@@ -2884,7 +2955,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"OK - Tarona Bot Supabase RAM 0.1s Active")
+        self.wfile.write(b"OK - Tarona Bot Supabase RAM Active")
 
     def log_message(self, format, *args):
         return
@@ -2933,7 +3004,7 @@ if __name__ == "__main__":
     threading.Thread(target=start_render_web_server, daemon=True).start()
     threading.Thread(target=background_supabase_sync_worker, daemon=True).start()
     threading.Thread(target=background_top_warmer, daemon=True).start()
-    print("🚀 Tarona Bot | Supabase + RAM 0.1s + Render ishga tushdi...")
+    print("🚀 Tarona Bot | Supabase + RAM + Render ishga tushdi...")
     while True:
         try:
             setup_bot_commands()
