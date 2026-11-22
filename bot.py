@@ -1,3 +1,8 @@
+# ==========================================
+# TARONA BOT - TO'LIQ OPTIMALLASHTIRILGAN VERSIYA
+# Tezlik: concurrent_fragment_downloads=16, aria2c support,
+# no re-encoding, stronger title cache, higher workers (20/12/64)
+# ==========================================
 import os
 import io
 import csv
@@ -44,11 +49,11 @@ if not os.path.exists(FFMPEG_BIN):
     if os.name != "nt":
         os.chmod(FFMPEG_BIN, 0o755)
 
-DOWNLOAD_SEMAPHORE = threading.Semaphore(12)
-SUB_CHECK_POOL = ThreadPoolExecutor(max_workers=24)
-YT_EXECUTOR = ThreadPoolExecutor(max_workers=6)
+DOWNLOAD_SEMAPHORE = threading.Semaphore(20)
+SUB_CHECK_POOL = ThreadPoolExecutor(max_workers=36)
+YT_EXECUTOR = ThreadPoolExecutor(max_workers=12)
 TOP_FETCH_LOCKS = {}
-bot = telebot.TeleBot(BOT_TOKEN, threaded=True, num_threads=48)
+bot = telebot.TeleBot(BOT_TOKEN, threaded=True, num_threads=64)
 BOT_USERNAME_CACHE = None
 
 def get_bot_username() -> str:
@@ -657,45 +662,68 @@ def _cookie_file_path():
 def get_ydl_opts(mode: str = "audio", outtmpl: str = None):
     cookie_path = _cookie_file_path()
 
-    if mode == "search":
-        opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'noplaylist': True,
-            'nocheckcertificate': True,
-            'socket_timeout': 10,
-            'retries': 2,
-            'extractor_args': {'youtube': {'player_client': ['android', 'web']}},
-        }
-        if cookie_path:
-            opts['cookiefile'] = cookie_path
-        return opts
-
     opts = {
-        'ffmpeg_location': FFMPEG_BIN,
         'quiet': True,
         'no_warnings': True,
         'noplaylist': True,
         'nocheckcertificate': True,
-        'socket_timeout': 12,
-        'retries': 2,
-        'fragment_retries': 2,
+        'socket_timeout': 6,
+        'retries': 1,
+        'fragment_retries': 1,
+        'skip_unavailable_fragments': True,
         'noprogress': True,
-        'extractor_args': {'youtube': {'player_client': ['android', 'tv_embedded', 'web']}},
+        'geo_bypass': True,
+        'concurrent_fragment_downloads': 16,
+        'http_chunk_size': 10_485_760,
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android', 'ios', 'tv_embedded'],
+                'player_skip': ['webpage', 'configs'],
+            }
+        },
     }
-
-    if mode == "audio":
-        # FFmpeg bilan qayta kodlamasdan eng tez tayyor audio oqimi
-        opts['format'] = 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best'
-    elif mode == "video":
-        opts['format'] = 'best[height<=480][ext=mp4]/best[ext=mp4]/best'
-
-    if outtmpl:
-        opts['outtmpl'] = outtmpl
-        opts['max_filesize'] = 49 * 1024 * 1024
 
     if cookie_path:
         opts['cookiefile'] = cookie_path
+
+    if mode == "search":
+        opts['extract_flat'] = True
+        return opts
+
+    opts['ffmpeg_location'] = FFMPEG_BIN
+
+    if mode == "audio":
+        # Eng tez format (qayta kodlamasdan)
+        opts['format'] = (
+            'bestaudio[ext=m4a][acodec^=mp4a]/'
+            'bestaudio[ext=m4a]/'
+            'bestaudio[ext=webm]/'
+            'bestaudio/best'
+        )
+        opts['postprocessors'] = []
+    else:
+        opts['format'] = (
+            'best[height<=360][ext=mp4][vcodec^=avc1]/'
+            'best[height<=480][ext=mp4]/'
+            'best[ext=mp4]/'
+            'best'
+        )
+
+    if outtmpl:
+        opts['outtmpl'] = outtmpl
+        opts['max_filesize'] = 48 * 1024 * 1024
+
+    if shutil.which("aria2c"):
+        opts['external_downloader'] = 'aria2c'
+        opts['external_downloader_args'] = {
+            'aria2c': [
+                '-x', '16',
+                '-s', '16',
+                '-k', '1M',
+                '--file-allocation=none',
+                '--allow-overwrite=true'
+            ]
+        }
 
     return opts
 
@@ -720,24 +748,37 @@ def _download_sync(url: str, base_path: str, mode: str = "audio"):
     with DOWNLOAD_SEMAPHORE:
         target_url, resolved_title, resolved_dur = _resolve_single_url(url)
         ydl_opts = get_ydl_opts(mode=mode, outtmpl=f"{base_path}.%(ext)s")
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(target_url, download=True)
-            if isinstance(info, dict) and "entries" in info and info["entries"]:
-                info = info["entries"][0]
-            print(f"⏱ {mode} yuklash: {time.time() - t0:.1f}s | {target_url}")
-            files = sorted(
-                glob.glob(f"{base_path}*"),
-                key=lambda p: os.path.getsize(p) if os.path.exists(p) else 0,
-                reverse=True
-            )
-            valid_files = [f for f in files if not f.endswith((".part", ".ytdl", ".temp"))]
-            chosen = valid_files[0] if valid_files else None
-            title = (info or {}).get("title") or resolved_title or "Media"
-            dur = (info or {}).get("duration") or resolved_dur or 0
-            return chosen, title, dur
+
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(target_url, download=True)
+
+                if isinstance(info, dict) and "entries" in info and info["entries"]:
+                    info = info["entries"][0]
+
+                files = sorted(
+                    glob.glob(f"{base_path}*"),
+                    key=lambda p: os.path.getsize(p) if os.path.exists(p) else 0,
+                    reverse=True
+                )
+                valid_files = [
+                    f for f in files
+                    if not f.endswith((".part", ".ytdl", ".temp", ".aria2"))
+                ]
+                chosen = valid_files[0] if valid_files else None
+
+                title = (info or {}).get("title") or resolved_title or "Media"
+                dur = (info or {}).get("duration") or resolved_dur or 0
+
+                print(f"⏱ {mode.upper()} {time.time() - t0:.1f}s | {target_url}")
+                return chosen, title, dur
+
+        except Exception as e:
+            print(f"❌ {mode} xato: {e}")
+            return None, resolved_title or "Media", resolved_dur or 0
 
 def download_file_turbo(url: str, base_path: str, mode: str = "audio"):
-    return YT_EXECUTOR.submit(_download_sync, url, base_path, mode).result(timeout=90)
+    return YT_EXECUTOR.submit(_download_sync, url, base_path, mode).result(timeout=160)
 
 # ==========================================
 # 5. RAM-FIRST USER, FAOLLIK, CHIQQANLAR VA KESH
@@ -2284,6 +2325,14 @@ def send_audio_by_url(
         return markup
 
     cached = get_cached_media(cache_id, custom_title or "")
+    
+    # Qo'shimcha kuchli kesh (title orqali)
+    if not cached and custom_title:
+        tk = normalize_title_key(custom_title)
+        with MEM_LOCK:
+            if tk in MEM["title_cache"]:
+                cached = MEM["title_cache"][tk]
+    
     if cached:
         file_id, _, title = cached
         final_title = custom_title or title
