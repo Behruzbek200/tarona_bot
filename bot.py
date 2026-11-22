@@ -44,8 +44,9 @@ if not os.path.exists(FFMPEG_BIN):
     if os.name != "nt":
         os.chmod(FFMPEG_BIN, 0o755)
 
-DOWNLOAD_SEMAPHORE = threading.Semaphore(16)
+DOWNLOAD_SEMAPHORE = threading.Semaphore(12)
 SUB_CHECK_POOL = ThreadPoolExecutor(max_workers=24)
+YT_EXECUTOR = ThreadPoolExecutor(max_workers=6)
 TOP_FETCH_LOCKS = {}
 bot = telebot.TeleBot(BOT_TOKEN, threaded=True, num_threads=48)
 BOT_USERNAME_CACHE = None
@@ -642,59 +643,101 @@ def background_supabase_sync_worker():
         flush_sync_queue_to_supabase()
 
 # ==========================================
-# 4. QIDIRUV VA YUKLASH SOZLAMALARI
+# 4. GITHUB USLUBIDAGI TEZKOR YUKLASH (ZERO-CONVERSION)
 # ==========================================
-def get_ydl_opts(mode: str = "audio", outtmpl: str = None):
-    if mode == "search":
-        return {
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['web', 'mweb'],
-                }
-            },
-            'js_runtimes': {'node': {}},
-            'source_address': '0.0.0.0',
-            'noplaylist': True,
-            'quiet': True,
-            'no_warnings': True,
-            'nocheckcertificate': True,
-            'retries': 3,
-            'socket_timeout': 20,
-        }
-
-    opts = {
-        'ffmpeg_location': FFMPEG_BIN,
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['tv', 'android_vr', 'web_safari'],
-            }
-        },
-        'js_runtimes': {'node': {}},
-        'source_address': '0.0.0.0',
-        'noplaylist': True,
-        'quiet': True,
-        'no_warnings': True,
-        'nocheckcertificate': True,
-        'retries': 3,
-        'fragment_retries': 3,
-        'socket_timeout': 20,
-        'concurrent_fragment_downloads': 8,
-        'http_chunk_size': 10 * 1024 * 1024,
-    }
-    if mode == "audio":
-        opts['format'] = 'bestaudio[ext=m4a][abr<=130]/bestaudio[ext=m4a]/bestaudio/best'
-    elif mode == "video":
-        opts['format'] = 'best[height<=720][ext=mp4]/best[height<=720]/best'
-    if outtmpl:
-        opts['outtmpl'] = outtmpl
-        opts['max_filesize'] = 49 * 1024 * 1024
+def _cookie_file_path():
     src = "cookies.txt" if os.path.exists("cookies.txt") else "/etc/secrets/cookies.txt"
     if os.path.exists(src):
         dst = "/tmp/yt_cookies.txt"
         if not os.path.exists(dst):
             shutil.copyfile(src, dst)
-        opts['cookiefile'] = dst
+        return dst
+    return None
+
+def get_ydl_opts(mode: str = "audio", outtmpl: str = None):
+    cookie_path = _cookie_file_path()
+
+    if mode == "search":
+        opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'noplaylist': True,
+            'nocheckcertificate': True,
+            'socket_timeout': 10,
+            'retries': 2,
+            'extractor_args': {'youtube': {'player_client': ['android', 'web']}},
+        }
+        if cookie_path:
+            opts['cookiefile'] = cookie_path
+        return opts
+
+    opts = {
+        'ffmpeg_location': FFMPEG_BIN,
+        'quiet': True,
+        'no_warnings': True,
+        'noplaylist': True,
+        'nocheckcertificate': True,
+        'socket_timeout': 12,
+        'retries': 2,
+        'fragment_retries': 2,
+        'noprogress': True,
+        'extractor_args': {'youtube': {'player_client': ['android', 'tv_embedded', 'web']}},
+    }
+
+    if mode == "audio":
+        # FFmpeg bilan qayta kodlamasdan eng tez tayyor audio oqimi
+        opts['format'] = 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best'
+    elif mode == "video":
+        opts['format'] = 'best[height<=480][ext=mp4]/best[ext=mp4]/best'
+
+    if outtmpl:
+        opts['outtmpl'] = outtmpl
+        opts['max_filesize'] = 49 * 1024 * 1024
+
+    if cookie_path:
+        opts['cookiefile'] = cookie_path
+
     return opts
+
+def _resolve_single_url(url: str):
+    if not url.startswith("ytsearch"):
+        return url, None, 0
+    search_opts = get_ydl_opts(mode="search")
+    search_opts['extract_flat'] = True
+    with yt_dlp.YoutubeDL(search_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+        entries = (info or {}).get("entries") or []
+        if entries and isinstance(entries[0], dict):
+            first = entries[0]
+            vid_url = first.get("url") or (f"https://www.youtube.com/watch?v={first['id']}" if first.get("id") else url)
+            if vid_url and not vid_url.startswith("http"):
+                vid_url = f"https://www.youtube.com/watch?v={vid_url}"
+            return vid_url, first.get("title"), first.get("duration", 0)
+    return url, None, 0
+
+def _download_sync(url: str, base_path: str, mode: str = "audio"):
+    t0 = time.time()
+    with DOWNLOAD_SEMAPHORE:
+        target_url, resolved_title, resolved_dur = _resolve_single_url(url)
+        ydl_opts = get_ydl_opts(mode=mode, outtmpl=f"{base_path}.%(ext)s")
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(target_url, download=True)
+            if isinstance(info, dict) and "entries" in info and info["entries"]:
+                info = info["entries"][0]
+            print(f"⏱ {mode} yuklash: {time.time() - t0:.1f}s | {target_url}")
+            files = sorted(
+                glob.glob(f"{base_path}*"),
+                key=lambda p: os.path.getsize(p) if os.path.exists(p) else 0,
+                reverse=True
+            )
+            valid_files = [f for f in files if not f.endswith((".part", ".ytdl", ".temp"))]
+            chosen = valid_files[0] if valid_files else None
+            title = (info or {}).get("title") or resolved_title or "Media"
+            dur = (info or {}).get("duration") or resolved_dur or 0
+            return chosen, title, dur
+
+def download_file_turbo(url: str, base_path: str, mode: str = "audio"):
+    return YT_EXECUTOR.submit(_download_sync, url, base_path, mode).result(timeout=90)
 
 # ==========================================
 # 5. RAM-FIRST USER, FAOLLIK, CHIQQANLAR VA KESH
@@ -1580,41 +1623,6 @@ def get_country_top_songs(country_code: str):
             return cached["entries"]
         return final_list
 
-def background_top_warmer():
-    time.sleep(5)
-    while True:
-        for c in TOP_COUNTRIES:
-            try:
-                entries = get_country_top_songs(c["code"])
-                for item in entries[:6]:
-                    if not get_cached_media(f"aud:{item['url']}", item.get("title", "")):
-                        try:
-                            base_path = f"downloads/pre_{c['code']}_{int(time.time()*1000)}_{random.randint(10,99)}"
-                            aud_file, dl_title, dur = download_file_turbo(item["url"], base_path, mode="audio")
-                            if aud_file and os.path.exists(aud_file):
-                                with open(aud_file, "rb") as aud:
-                                    sent_msg = bot.send_audio(
-                                        SUPER_ADMIN_ID,
-                                        aud,
-                                        title=item.get("title") or dl_title,
-                                        duration=int(dur) if dur else None,
-                                        disable_notification=True
-                                    )
-                                if sent_msg and sent_msg.audio:
-                                    save_cached_media(f"aud:{item['url']}", sent_msg.audio.file_id, "audio", item.get("title") or dl_title)
-                                    try:
-                                        bot.delete_message(SUPER_ADMIN_ID, sent_msg.message_id)
-                                    except Exception:
-                                        pass
-                                os.remove(aud_file)
-                        except Exception:
-                            pass
-                        time.sleep(1.5)
-            except Exception:
-                pass
-            time.sleep(2)
-        time.sleep(600)
-
 def open_top_for_country(chat_id: int, user_id: int, country_code: str = "uz", edit_msg_id: int = None):
     c_info = get_country_info(country_code)
     lang = get_user_lang(user_id) or "uz"
@@ -2233,55 +2241,8 @@ def handle_admin_wizard(message: types.Message):
         )
 
 # ==========================================
-# 11. KESH + OLDINDAN YUKLASH + ZAXIRA MANBA
+# 11. KESH VA YUKLASH YUBORUVCHILAR
 # ==========================================
-PREFETCH_INFLIGHT = {}
-PREFETCH_SEM = threading.Semaphore(4)
-
-def _prefetch_one(url: str, title: str = ""):
-    key = f"aud:{url}"
-    if get_cached_media(key, title):
-        return
-    with MEM_LOCK:
-        if url in PREFETCH_INFLIGHT:
-            return
-        ev = threading.Event()
-        PREFETCH_INFLIGHT[url] = ev
-    aud_file = None
-    try:
-        with PREFETCH_SEM:
-            base = f"downloads/pf_{int(time.time()*1000)}_{random.randint(100,999)}"
-            aud_file, dl_title, dur = download_file_turbo(url, base, mode="audio")
-            if aud_file and os.path.exists(aud_file):
-                with open(aud_file, "rb") as a:
-                    sent = bot.send_audio(
-                        SUPER_ADMIN_ID, a,
-                        title=title or dl_title,
-                        duration=int(dur) if dur else None,
-                        disable_notification=True
-                    )
-                if sent and sent.audio:
-                    save_cached_media(key, sent.audio.file_id, "audio", title or dl_title)
-                    try:
-                        bot.delete_message(SUPER_ADMIN_ID, sent.message_id)
-                    except Exception:
-                        pass
-    except Exception:
-        pass
-    finally:
-        if aud_file and os.path.exists(aud_file):
-            try:
-                os.remove(aud_file)
-            except Exception:
-                pass
-        with MEM_LOCK:
-            PREFETCH_INFLIGHT.pop(url, None)
-        ev.set()
-
-def prefetch_entries(entries, n: int = 3):
-    for it in entries[:n]:
-        threading.Thread(target=_prefetch_one, args=(it["url"], it.get("title", "")), daemon=True).start()
-
 def safe_animate_progress(chat_id: int, msg_id: int, label: str, stop_event: threading.Event):
     frames = [".", "..", "..."]
     idx = 0
@@ -2291,24 +2252,6 @@ def safe_animate_progress(chat_id: int, msg_id: int, label: str, stop_event: thr
         except Exception:
             break
         idx += 1
-
-def download_file_turbo(url: str, base_path: str, mode: str = "audio"):
-    t0 = time.time()
-    with DOWNLOAD_SEMAPHORE:
-        ydl_opts = get_ydl_opts(mode=mode, outtmpl=f"{base_path}.%(ext)s")
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            print(f"⏱ {mode} yuklash: {time.time()-t0:.1f}s | {url}")
-            if isinstance(info, dict) and "entries" in info and info["entries"]:
-                info = info["entries"][0]
-            files = sorted(
-                glob.glob(f"{base_path}*"),
-                key=lambda p: os.path.getsize(p) if os.path.exists(p) else 0,
-                reverse=True
-            )
-            valid_files = [f for f in files if not f.endswith((".part", ".ytdl", ".temp"))]
-            chosen_file = valid_files[0] if valid_files else None
-            return chosen_file, info.get('title', 'Media'), info.get('duration', 0)
 
 def send_audio_by_url(
     chat_id: int,
@@ -2340,13 +2283,6 @@ def send_audio_by_url(
             markup.add(ad_btn)
         return markup
 
-    ev = PREFETCH_INFLIGHT.get(url)
-    if ev and not get_cached_media(cache_id, custom_title or ""):
-        try:
-            bot.send_chat_action(chat_id, "upload_voice")
-        except Exception:
-            pass
-        ev.wait(timeout=45)
     cached = get_cached_media(cache_id, custom_title or "")
     if cached:
         file_id, _, title = cached
@@ -2382,16 +2318,17 @@ def send_audio_by_url(
     try:
         try:
             aud_file, title, duration = download_file_turbo(active_url, base_path, mode="audio")
-        except Exception:
+        except Exception as e_yt:
+            print(f"⚠️ YT audio xato ({active_url}): {e_yt}")
             aud_file, title, duration = None, custom_title or "Audio", 0
 
-        if not aud_file or not os.path.exists(aud_file):
-            if custom_title:
-                active_url = f"scsearch1:{custom_title}"
-                try:
-                    aud_file, title, duration = download_file_turbo(active_url, base_path + "_fb", mode="audio")
-                except Exception:
-                    aud_file = None
+        if (not aud_file or not os.path.exists(aud_file)) and custom_title:
+            active_url = f"scsearch1:{custom_title}"
+            try:
+                aud_file, title, duration = download_file_turbo(active_url, base_path + "_sc", mode="audio")
+            except Exception as e_sc:
+                print(f"⚠️ SC audio xato ({active_url}): {e_sc}")
+                aud_file = None
 
         stop_ev.set()
         final_title = custom_title or title or "Audio"
@@ -2424,7 +2361,8 @@ def send_audio_by_url(
                 pass
         else:
             bot.edit_message_text(t(uid, "dl_audio_err"), chat_id, wait_msg.message_id, parse_mode="HTML")
-    except Exception:
+    except Exception as e_send:
+        print(f"⚠️ Audio yuborish xatosi: {e_send}")
         stop_ev.set()
         try:
             bot.edit_message_text(t(uid, "dl_audio_err"), chat_id, wait_msg.message_id, parse_mode="HTML")
@@ -2485,7 +2423,8 @@ def send_video_by_url(chat_id: int, url: str, user_id: int = None, reply_to_id: 
             bot.delete_message(chat_id, wait_msg.message_id)
         else:
             bot.edit_message_text(t(uid, "dl_video_err"), chat_id, wait_msg.message_id, parse_mode="HTML")
-    except Exception:
+    except Exception as e_vid:
+        print(f"⚠️ Video xato ({url}): {e_vid}")
         stop_ev.set()
         bot.edit_message_text(t(uid, "dl_video_err"), chat_id, wait_msg.message_id, parse_mode="HTML")
         if downloaded_file and os.path.exists(downloaded_file):
@@ -2720,7 +2659,6 @@ def handle_text_search(message: types.Message):
         SEARCH_CACHE[f"srch_{uid}"] = {'query': query, 'entries': entries, 'mode': 'search'}
         text, markup = build_search_page(uid, page=0)
         bot.reply_to(message, text, reply_markup=markup, parse_mode="HTML")
-        prefetch_entries(entries, 3)
     except Exception:
         bot.reply_to(message, t(uid, "search_err"), parse_mode="HTML")
 
@@ -2994,7 +2932,6 @@ if __name__ == "__main__":
     init_and_load_supabase()
     threading.Thread(target=start_render_web_server, daemon=True).start()
     threading.Thread(target=background_supabase_sync_worker, daemon=True).start()
-    threading.Thread(target=background_top_warmer, daemon=True).start()
     print("🚀 Tarona Bot | Supabase + RAM + Render ishga tushdi...")
     while True:
         try:
