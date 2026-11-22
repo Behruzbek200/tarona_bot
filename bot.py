@@ -30,9 +30,9 @@ PORT = int(os.environ.get("PORT", "10000"))
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN muhit o'zgaruvchisi kiritilmagan!")
 
-apihelper.CONNECT_TIMEOUT = 30
-apihelper.READ_TIMEOUT = 180
-apihelper.WRITE_TIMEOUT = 180
+apihelper.CONNECT_TIMEOUT = 20
+apihelper.READ_TIMEOUT = 90
+apihelper.WRITE_TIMEOUT = 90
 
 os.makedirs("bin", exist_ok=True)
 os.makedirs("downloads", exist_ok=True)
@@ -44,10 +44,17 @@ if not os.path.exists(FFMPEG_BIN):
     if os.name != "nt":
         os.chmod(FFMPEG_BIN, 0o755)
 
-DOWNLOAD_SEMAPHORE = threading.Semaphore(14)
+DOWNLOAD_SEMAPHORE = threading.Semaphore(16)
 SUB_CHECK_POOL = ThreadPoolExecutor(max_workers=24)
 TOP_FETCH_LOCKS = {}
-bot = telebot.TeleBot(BOT_TOKEN, threaded=True, num_threads=40)
+bot = telebot.TeleBot(BOT_TOKEN, threaded=True, num_threads=48)
+BOT_USERNAME_CACHE = None
+
+def get_bot_username() -> str:
+    global BOT_USERNAME_CACHE
+    if not BOT_USERNAME_CACHE:
+        BOT_USERNAME_CACHE = bot.get_me().username or "bot"
+    return BOT_USERNAME_CACHE
 
 # ==========================================
 # 2. TEZKOR RAM XOTIRA VA ASINXRON SYNC NAVBATI
@@ -64,27 +71,30 @@ MEM = {
     "ads": {},              # ad_id -> dict
     "favorites": {},        # user_id -> list of dict
     "media_cache": {},      # cache_key -> (file_id, media_type, title)
+    "title_cache": {},      # normalized_title -> (file_id, media_type, title)
     "sub_ttl": {},          # (user_id, channel_id) -> {"ts": float, "ok": bool}
     "popup_cd": {}          # user_id -> float
 }
 
 SYNC_QUEUE = {
-    "users": {},            # user_id -> tuple
-    "sub_logs": [],         # list of tuples
-    "join_req": [],         # list of tuples
-    "ch_counts": set(),     # channel_id set
-    "ad_views": {},         # ad_id -> delta int
-    "media_cache": {},      # cache_key -> tuple
-    "fav_add": [],          # list of (user_id, title, url)
-    "fav_del": []           # list of (user_id, url)
+    "users": {},
+    "sub_logs": [],
+    "join_req": [],
+    "ch_counts": set(),
+    "ad_views": {},
+    "media_cache": {},
+    "fav_add": [],
+    "fav_del": []
 }
 
 SEARCH_CACHE = {}
+QUERY_RESULT_CACHE = {}     # norm_query -> {"ts": float, "entries": list}
 INLINE_RESULTS_CACHE = {}
 TOP_COUNTRY_CACHE = {}
 ADMIN_STATE = {}
 BROADCAST_STOP = False
-TOP_CACHE_TTL = 600.0
+TOP_CACHE_TTL = 900.0
+QUERY_CACHE_TTL = 600.0
 
 TOP_COUNTRIES = [
     {
@@ -152,7 +162,7 @@ LANG_TEXTS = {
         "start_msg": (
             "🔥 <b>Assalomu alaykum! @{bot_user} ga xush kelibsiz!</b>\n\n"
             "📥 <b>Video, rasm va media yuklash:</b>\n"
-            "<b>Instagram, YouTube, TikTok, Facebook, Pinterest, Snapchat, Likee, Telegram</b> va <b>Threads</b> havolalarini yuboring — bir zumda yuklab beraman. Videodan <b>MP3</b> ajratish ham bor!\n\n"
+            "<b>Instagram, YouTube, TikTok, Facebook, Pinterest, Snapchat, Likee, Telegram</b> va <b>Threads</b> havolalarini yuboring — tez yuklab beraman. Videodan <b>MP3</b> ajratish ham bor!\n\n"
             "🎶 <b>Qo'shiq qidirish va yuklash:</b>\n"
             "Qo'shiq nomi, ijrochi yoki <b>istalgan matni/so'zlari</b> bo'yicha topib, yuqori sifatda yuklab oling.\n\n"
             "🎙 <b>Shazam — musiqani aniqlash:</b>\n"
@@ -274,6 +284,10 @@ LANG_TEXTS = {
 
 def esc(text: str) -> str:
     return html.escape(str(text))
+
+def normalize_title_key(title: str) -> str:
+    cleaned = "".join(ch.lower() if ch.isalnum() else " " for ch in (title or ""))
+    return " ".join(cleaned.split())
 
 def normalize_tg_url(raw_url: str) -> str:
     u = (raw_url or "").strip()
@@ -490,6 +504,10 @@ def init_and_load_supabase():
         cur.execute("SELECT cache_key, file_id, media_type, title FROM media_cache")
         for ck, fid, mt, ttl in cur.fetchall():
             MEM["media_cache"][ck] = (fid, mt, ttl)
+            if mt == "audio" and ttl:
+                tk = normalize_title_key(ttl)
+                if tk:
+                    MEM["title_cache"][tk] = (fid, mt, ttl)
 
     cur.close()
     conn.close()
@@ -620,37 +638,45 @@ def flush_sync_queue_to_supabase():
 
 def background_supabase_sync_worker():
     while True:
-        time.sleep(12)
+        time.sleep(8)
         flush_sync_queue_to_supabase()
 
 # ==========================================
-# 4. TEZKOR YUKLASH SOZLAMALARI
+# 4. 0.1s TEZLIKLI YUKLASH SOZLAMALARI
 # ==========================================
 def get_ydl_opts(mode: str = "audio", outtmpl: str = None):
     opts = {
         'ffmpeg_location': FFMPEG_BIN,
-        'extractor_args': {'youtube': {'player_client': ['android', 'web']}},
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android', 'ios', 'web'],
+                'skip': ['dash', 'hls'] if mode == "audio" else []
+            }
+        },
         'source_address': '0.0.0.0',
         'noplaylist': True,
         'quiet': True,
         'no_warnings': True,
-        'retries': 2,
-        'fragment_retries': 2,
-        'socket_timeout': 12,
-        'concurrent_fragment_downloads': 8,
+        'nocheckcertificate': True,
+        'retries': 1,
+        'fragment_retries': 1,
+        'socket_timeout': 8,
+        'concurrent_fragment_downloads': 12,
         'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+            'User-Agent': 'com.google.android.youtube/19.29.37 (Linux; U; Android 14) gzip',
         }
     }
     if mode == "audio":
-        opts['format'] = 'bestaudio/best'
+        opts['format'] = 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best'
     elif mode == "video":
-        opts['format'] = 'best[height<=720]/best/bestvideo+bestaudio'
+        opts['format'] = 'best[height<=720][ext=mp4]/best[height<=720]/best'
     if outtmpl:
         opts['outtmpl'] = outtmpl
         opts['max_filesize'] = 49 * 1024 * 1024
     if os.path.exists("cookies.txt"):
         opts['cookiefile'] = "cookies.txt"
+    elif os.path.exists("/etc/secrets/cookies.txt"):
+        opts['cookiefile'] = "/etc/secrets/cookies.txt"
     return opts
 
 # ==========================================
@@ -751,7 +777,7 @@ def inc_total_requests():
         MEM["settings"]["total_requests"] = str(cur + 1)
 
 def build_media_caption(prefix_line: str = "", ad_line: str = "") -> str:
-    bot_username = bot.get_me().username
+    bot_username = get_bot_username()
     parts = []
     if prefix_line:
         parts.append(prefix_line)
@@ -805,7 +831,7 @@ def register_chat(chat_id: int, chat_type: str = "private"):
             }
             SYNC_QUEUE["users"][chat_id] = (chat_id, chat_type, "", 0, 0, now, now)
         else:
-            if u["is_left"] == 1 or (now - u["last_active"] > 60):
+            if u["is_left"] == 1 or (now - u["last_active"] > 120):
                 u["is_left"] = 0
                 u["last_active"] = now
                 SYNC_QUEUE["users"][chat_id] = (
@@ -819,14 +845,25 @@ def is_user_banned(user_id: int) -> bool:
         u = MEM["users"].get(user_id)
         return bool(u and u["is_banned"] == 1)
 
-def get_cached_media(cache_key: str):
+def get_cached_media(cache_key: str, title: str = ""):
     with MEM_LOCK:
-        return MEM["media_cache"].get(cache_key)
+        hit = MEM["media_cache"].get(cache_key)
+        if hit:
+            return hit
+        if title:
+            tk = normalize_title_key(title)
+            if tk and tk in MEM["title_cache"]:
+                return MEM["title_cache"][tk]
+    return None
 
 def save_cached_media(cache_key: str, file_id: str, media_type: str, title: str):
     with MEM_LOCK:
         MEM["media_cache"][cache_key] = (file_id, media_type, title)
         SYNC_QUEUE["media_cache"][cache_key] = (cache_key, file_id, media_type, title)
+        if media_type == "audio" and title:
+            tk = normalize_title_key(title)
+            if tk:
+                MEM["title_cache"][tk] = (file_id, media_type, title)
 
 def get_detailed_stats():
     now = time.time()
@@ -1015,14 +1052,13 @@ def check_subscription_fast(user, force_fresh: bool = False):
             safe_url = normalize_tg_url(ch["channel_url"])
             cache_key = (uid, cid)
 
-            # Zayavka yuborilgan yoki logda bor bo'lsa — bir zumda o'tkazamiz
             if cache_key in MEM["join_requests"] or cache_key in MEM["sub_log_keys"]:
                 MEM["sub_ttl"][cache_key] = {"ts": now, "ok": True}
                 continue
 
             cached_sub = MEM["sub_ttl"].get(cache_key)
             if not force_fresh and cached_sub:
-                ttl = 25.0 if cached_sub["ok"] else 6.0
+                ttl = 60.0 if cached_sub["ok"] else 8.0
                 if now - cached_sub["ts"] < ttl:
                     if not cached_sub["ok"]:
                         not_subscribed.append((cid, ch["title"], ch["channel_type"], safe_url))
@@ -1035,7 +1071,7 @@ def check_subscription_fast(user, force_fresh: bool = False):
             SUB_CHECK_POOL.submit(_check_single_channel_member, uid, item[0]): item
             for item in to_query_api
         }
-        for fut in as_completed(futures, timeout=4.0):
+        for fut in as_completed(futures, timeout=3.0):
             cid, title, ch_type, safe_url = futures[fut]
             try:
                 ok = bool(fut.result())
@@ -1405,7 +1441,7 @@ def get_admin_reply_keyboard():
     return kb
 
 def send_home_menu(chat_id: int, user_id: int, is_private: bool):
-    bot_username = bot.get_me().username
+    bot_username = get_bot_username()
     text = t(user_id, "start_msg", bot_user=esc(bot_username))
     markup = types.InlineKeyboardMarkup()
     markup.add(
@@ -1532,11 +1568,35 @@ def background_top_warmer():
     while True:
         for c in TOP_COUNTRIES:
             try:
-                get_country_top_songs(c["code"])
+                entries = get_country_top_songs(c["code"])
+                for item in entries[:6]:
+                    if not get_cached_media(f"aud:{item['url']}", item.get("title", "")):
+                        try:
+                            base_path = f"downloads/pre_{c['code']}_{int(time.time()*1000)}_{random.randint(10,99)}"
+                            aud_file, dl_title, dur = download_file_turbo(item["url"], base_path, mode="audio")
+                            if aud_file and os.path.exists(aud_file):
+                                with open(aud_file, "rb") as aud:
+                                    sent_msg = bot.send_audio(
+                                        SUPER_ADMIN_ID,
+                                        aud,
+                                        title=item.get("title") or dl_title,
+                                        duration=int(dur) if dur else None,
+                                        disable_notification=True
+                                    )
+                                if sent_msg and sent_msg.audio:
+                                    save_cached_media(f"aud:{item['url']}", sent_msg.audio.file_id, "audio", item.get("title") or dl_title)
+                                    try:
+                                        bot.delete_message(SUPER_ADMIN_ID, sent_msg.message_id)
+                                    except Exception:
+                                        pass
+                                os.remove(aud_file)
+                        except Exception:
+                            pass
+                        time.sleep(1.5)
             except Exception:
                 pass
             time.sleep(2)
-        time.sleep(480)
+        time.sleep(600)
 
 def open_top_for_country(chat_id: int, user_id: int, country_code: str = "uz", edit_msg_id: int = None):
     c_info = get_country_info(country_code)
@@ -1667,7 +1727,7 @@ def get_admin_dashboard_text():
     st = get_detailed_stats()
     tag_txt = "Ko'rinadi (@bot)" if is_show_bot_tag() else "Yashirilgan"
     return (
-        f"👑 <b>Boshqaruv Paneli (Supabase + RAM Turbo)</b>\n\n"
+        f"👑 <b>Boshqaruv Paneli (Supabase + RAM 0.1s)</b>\n\n"
         f"👤 Shaxsiy: <b>{st['total_priv']}</b> (🟢 Faol: <b>{st['alive_priv']}</b> | 🔴 Chiqqan: <b>{st['left_priv']}</b>)\n"
         f"👥 Guruhlar: <b>{st['total_grp']}</b> (🟢 Faol: <b>{st['alive_grp']}</b> | 🔴 Chiqqan: <b>{st['left_grp']}</b>)\n"
         f"📈 Qo'shilgan: Bugun <b>+{st['joined_24h']}</b> | 7 kun <b>+{st['joined_7d']}</b> | 30 kun <b>+{st['joined_30d']}</b>\n"
@@ -1686,7 +1746,7 @@ def admin_callbacks(call: types.CallbackQuery):
     global BROADCAST_STOP
     uid = call.from_user.id
     action = call.data.split(":")[1]
-    bot_username = bot.get_me().username
+    bot_username = get_bot_username()
 
     if action == "back":
         ADMIN_STATE.pop(uid, None)
@@ -1852,9 +1912,11 @@ def admin_callbacks(call: types.CallbackQuery):
     elif action == "clear_cache":
         with MEM_LOCK:
             MEM["media_cache"].clear()
+            MEM["title_cache"].clear()
             MEM["sub_ttl"].clear()
             SYNC_QUEUE["media_cache"].clear()
         TOP_COUNTRY_CACHE.clear()
+        QUERY_RESULT_CACHE.clear()
         INLINE_RESULTS_CACHE.clear()
         exec_immediate_pg("DELETE FROM media_cache")
         bot.answer_callback_query(call.id, "⚡ Kesh tozalandi!", show_alert=True)
@@ -1946,7 +2008,7 @@ def execute_broadcast_worker(admin_chat_id: int, from_chat_id: int, message_id: 
                 except Exception:
                     pass
             sent += 1
-            time.sleep(0.04)
+            time.sleep(0.035)
         except Exception as err:
             failed += 1
             err_s = str(err).lower()
@@ -1991,7 +2053,7 @@ def handle_admin_wizard(message: types.Message):
     uid = message.from_user.id
     st = ADMIN_STATE.get(uid, {})
     step = st.get("step")
-    bot_username = bot.get_me().username
+    bot_username = get_bot_username()
 
     if step == "wait_ch_id":
         ch_id, ch_title = None, "Kanal/Guruh"
@@ -2154,12 +2216,12 @@ def handle_admin_wizard(message: types.Message):
         )
 
 # ==========================================
-# 11. YUKLASH, KESH VA ANIMATSIYA
+# 11. 0.1s KESH + YUKLASH + ZAXIRA MANBA
 # ==========================================
 def safe_animate_progress(chat_id: int, msg_id: int, label: str, stop_event: threading.Event):
     frames = [".", "..", "..."]
     idx = 0
-    while not stop_event.wait(1.5):
+    while not stop_event.wait(2.0):
         try:
             bot.edit_message_text(f"<b>{label}{frames[idx % len(frames)]}</b>", chat_id, msg_id, parse_mode="HTML")
         except Exception:
@@ -2171,23 +2233,51 @@ def download_file_turbo(url: str, base_path: str, mode: str = "audio"):
         ydl_opts = get_ydl_opts(mode=mode, outtmpl=f"{base_path}.%(ext)s")
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            files = glob.glob(f"{base_path}*")
-            return (files[0] if files else None), info.get('title', 'Media'), info.get('duration', 0)
+            if isinstance(info, dict) and "entries" in info and info["entries"]:
+                info = info["entries"][0]
+            files = sorted(
+                glob.glob(f"{base_path}*"),
+                key=lambda p: os.path.getsize(p) if os.path.exists(p) else 0,
+                reverse=True
+            )
+            valid_files = [f for f in files if not f.endswith((".part", ".ytdl", ".temp"))]
+            chosen_file = valid_files[0] if valid_files else None
+            return chosen_file, info.get('title', 'Media'), info.get('duration', 0)
 
-def send_audio_by_url(chat_id: int, url: str, user_id: int = None, with_video_btn: bool = False, performer: str = None, custom_title: str = None, reply_to_id: int = None):
+def _find_fallback_url(query_text: str, failed_url: str):
+    if not query_text:
+        return None
+    try:
+        alt_items = _yt_flat_search(f"ytsearch3:{query_text}", filter_mixes=False)
+        for item in alt_items:
+            if item.get("url") and item["url"] != failed_url:
+                return item["url"]
+    except Exception:
+        pass
+    return None
+
+def send_audio_by_url(
+    chat_id: int,
+    url: str,
+    user_id: int = None,
+    with_video_btn: bool = False,
+    performer: str = None,
+    custom_title: str = None,
+    reply_to_id: int = None
+):
     uid = user_id or chat_id
     cache_id = f"aud:{url}"
     cap_ad = get_caption_ad_line()
     final_caption = build_media_caption(prefix_line="", ad_line=cap_ad) or None
 
-    def attach_buttons(song_title: str):
+    def attach_buttons(song_title: str, target_url: str):
         markup = types.InlineKeyboardMarkup()
         fav_key = f"fav_{uid}_{int(time.time()*1000)}_{random.randint(10,99)}"
-        SEARCH_CACHE[fav_key] = {"title": song_title, "url": url}
+        SEARCH_CACHE[fav_key] = {"title": song_title, "url": target_url}
         row_btns = [types.InlineKeyboardButton(text=t(uid, "fav_add"), callback_data=f"fav_toggle:{fav_key}")]
         if with_video_btn:
             vid_key = f"vid_{chat_id}_{int(time.time()*1000)}_{random.randint(10,99)}"
-            SEARCH_CACHE[vid_key] = url
+            SEARCH_CACHE[vid_key] = target_url
             row_btns.append(types.InlineKeyboardButton(text=t(uid, "dl_video_btn"), callback_data=f"get_vid:{vid_key}"))
         markup.add(*row_btns)
         markup.add(types.InlineKeyboardButton(text=t(uid, "share_inline_btn"), switch_inline_query=song_title[:60]))
@@ -2196,43 +2286,96 @@ def send_audio_by_url(chat_id: int, url: str, user_id: int = None, with_video_bt
             markup.add(ad_btn)
         return markup
 
-    cached = get_cached_media(cache_id)
+    # 1. Keshda bo'lsa (~0.1s da darhol yuboradi)
+    cached = get_cached_media(cache_id, custom_title or "")
     if cached:
         file_id, _, title = cached
         final_title = custom_title or title
-        bot.send_audio(chat_id, file_id, title=final_title, performer=performer,
-                       caption=final_caption, reply_markup=attach_buttons(final_title), reply_to_message_id=reply_to_id, parse_mode="HTML")
-        return
+        try:
+            bot.send_audio(
+                chat_id,
+                file_id,
+                title=final_title,
+                performer=performer,
+                caption=final_caption,
+                reply_markup=attach_buttons(final_title, url),
+                reply_to_message_id=reply_to_id,
+                parse_mode="HTML"
+            )
+            return
+        except Exception:
+            pass
 
     wait_msg = bot.send_message(chat_id, f"<b>{t(uid, 'loading')}.</b>", parse_mode="HTML")
     stop_ev = threading.Event()
-    anim_t = threading.Thread(target=safe_animate_progress, args=(chat_id, wait_msg.message_id, t(uid, "loading"), stop_ev), daemon=True)
+    anim_t = threading.Thread(
+        target=safe_animate_progress,
+        args=(chat_id, wait_msg.message_id, t(uid, "loading"), stop_ev),
+        daemon=True
+    )
     anim_t.start()
 
-    base_path = f"downloads/aud_{chat_id}_{int(time.time()*1000)}"
+    base_path = f"downloads/aud_{chat_id}_{int(time.time()*1000)}_{random.randint(10,99)}"
     aud_file = None
+    active_url = url
+
     try:
-        aud_file, title, duration = download_file_turbo(url, base_path, mode="audio")
+        try:
+            aud_file, title, duration = download_file_turbo(active_url, base_path, mode="audio")
+        except Exception:
+            aud_file, title, duration = None, custom_title or "Audio", 0
+
+        if not aud_file or not os.path.exists(aud_file):
+            fallback_url = _find_fallback_url(custom_title, active_url)
+            if fallback_url:
+                active_url = fallback_url
+                try:
+                    aud_file, title, duration = download_file_turbo(active_url, base_path + "_fb", mode="audio")
+                except Exception:
+                    aud_file = None
+
         stop_ev.set()
-        final_title = custom_title or title
+        final_title = custom_title or title or "Audio"
+
         if aud_file and os.path.exists(aud_file):
             with open(aud_file, "rb") as aud:
                 sent_msg = bot.send_audio(
-                    chat_id, aud, title=final_title, performer=performer,
+                    chat_id,
+                    aud,
+                    title=final_title,
+                    performer=performer,
                     duration=int(duration) if duration else None,
-                    caption=final_caption, reply_markup=attach_buttons(final_title),
-                    reply_to_message_id=reply_to_id, parse_mode="HTML", timeout=180
+                    caption=final_caption,
+                    reply_markup=attach_buttons(final_title, active_url),
+                    reply_to_message_id=reply_to_id,
+                    parse_mode="HTML",
+                    timeout=90
                 )
-            save_cached_media(cache_id, sent_msg.audio.file_id, "audio", final_title)
-            os.remove(aud_file)
-            bot.delete_message(chat_id, wait_msg.message_id)
+            if sent_msg and sent_msg.audio:
+                save_cached_media(cache_id, sent_msg.audio.file_id, "audio", final_title)
+                if active_url != url:
+                    save_cached_media(f"aud:{active_url}", sent_msg.audio.file_id, "audio", final_title)
+            try:
+                os.remove(aud_file)
+            except Exception:
+                pass
+            try:
+                bot.delete_message(chat_id, wait_msg.message_id)
+            except Exception:
+                pass
         else:
             bot.edit_message_text(t(uid, "dl_audio_err"), chat_id, wait_msg.message_id, parse_mode="HTML")
     except Exception:
         stop_ev.set()
-        bot.edit_message_text(t(uid, "dl_audio_err"), chat_id, wait_msg.message_id, parse_mode="HTML")
+        try:
+            bot.edit_message_text(t(uid, "dl_audio_err"), chat_id, wait_msg.message_id, parse_mode="HTML")
+        except Exception:
+            pass
         if aud_file and os.path.exists(aud_file):
-            os.remove(aud_file)
+            try:
+                os.remove(aud_file)
+            except Exception:
+                pass
 
 def send_video_by_url(chat_id: int, url: str, user_id: int = None, reply_to_id: int = None):
     uid = user_id or chat_id
@@ -2273,11 +2416,11 @@ def send_video_by_url(chat_id: int, url: str, user_id: int = None, reply_to_id: 
             with open(downloaded_file, "rb") as f:
                 if ext in [".jpg", ".jpeg", ".png", ".webp"]:
                     cap = build_media_caption(f"🖼 <b>{esc(title)}</b>", cap_ad)
-                    sent_msg = bot.send_photo(chat_id, f, caption=cap, reply_to_message_id=reply_to_id, parse_mode="HTML", timeout=180)
+                    sent_msg = bot.send_photo(chat_id, f, caption=cap, reply_to_message_id=reply_to_id, parse_mode="HTML", timeout=90)
                     save_cached_media(cache_id, sent_msg.photo[-1].file_id, "photo", title)
                 else:
                     cap = build_media_caption(f"🎬 <b>{esc(title)}</b>", cap_ad)
-                    sent_msg = bot.send_video(chat_id, f, caption=cap, reply_to_message_id=reply_to_id, reply_markup=markup, parse_mode="HTML", timeout=180)
+                    sent_msg = bot.send_video(chat_id, f, caption=cap, reply_to_message_id=reply_to_id, reply_markup=markup, parse_mode="HTML", timeout=90)
                     save_cached_media(cache_id, sent_msg.video.file_id, "video", title)
             os.remove(downloaded_file)
             bot.delete_message(chat_id, wait_msg.message_id)
@@ -2426,13 +2569,18 @@ def _yt_flat_search(search_expr: str, filter_mixes: bool = False):
 
 def search_music(query: str):
     clean_q = " ".join(query.strip().split())
+    q_key = clean_q.lower()
+    now = time.time()
+    cached_q = QUERY_RESULT_CACHE.get(q_key)
+    if cached_q and (now - cached_q["ts"] < QUERY_CACHE_TTL):
+        return cached_q["entries"]
+
     combined = []
     seen = set()
 
     queries_to_run = [f"ytsearch15:{clean_q}"]
-    words = clean_q.split()
-    if len(words) >= 3:
-        queries_to_run.append(f"ytsearch10:{clean_q} lyrics song")
+    if len(clean_q.split()) >= 3:
+        queries_to_run.append(f"ytsearch8:{clean_q} lyrics song")
 
     for expr in queries_to_run:
         try:
@@ -2443,7 +2591,10 @@ def search_music(query: str):
         except Exception:
             continue
 
-    return combined[:20]
+    final_entries = combined[:20]
+    if final_entries:
+        QUERY_RESULT_CACHE[q_key] = {"ts": now, "entries": final_entries}
+    return final_entries
 
 def build_search_page(user_id: int, page: int = 0):
     data = SEARCH_CACHE.get(f"srch_{user_id}")
@@ -2496,8 +2647,9 @@ def handle_text_search(message: types.Message):
         return
     uid = message.from_user.id
 
-    bot.send_chat_action(message.chat.id, "typing")
     query = message.text.strip()
+    if query.lower() not in QUERY_RESULT_CACHE:
+        bot.send_chat_action(message.chat.id, "typing")
     try:
         entries = search_music(query)
         if not entries:
@@ -2586,7 +2738,7 @@ def inline_music_search(inline_query: types.InlineQuery):
         return
 
     q = (inline_query.query or "").strip()
-    bot_username = bot.get_me().username
+    bot_username = get_bot_username()
     cap_ad = get_caption_ad_line()
     final_caption = build_media_caption(prefix_line="", ad_line=cap_ad) or f"📥 @{esc(bot_username)}"
 
@@ -2600,7 +2752,7 @@ def inline_music_search(inline_query: types.InlineQuery):
         url = item["url"]
         title = item["title"]
         dur = item.get("duration", "")
-        cached = get_cached_media(f"aud:{url}")
+        cached = get_cached_media(f"aud:{url}", title)
 
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton(text=f"🔎 @{bot_username}", switch_inline_query=""))
@@ -2641,7 +2793,7 @@ def inline_music_search(inline_query: types.InlineQuery):
         bot.answer_inline_query(
             inline_query.id,
             results,
-            cache_time=10,
+            cache_time=20,
             is_personal=True,
             switch_pm_text="🎙 Ovoz orqali qidirish (Shazam)",
             switch_pm_parameter="shazam"
@@ -2659,7 +2811,7 @@ def chosen_inline_audio_loader(chosen: types.ChosenInlineResult):
 
     url = data["url"]
     title = data["title"]
-    bot_username = bot.get_me().username
+    bot_username = get_bot_username()
     cap_ad = get_caption_ad_line()
     final_caption = build_media_caption(prefix_line="", ad_line=cap_ad) or f"📥 @{esc(bot_username)}"
 
@@ -2668,6 +2820,22 @@ def chosen_inline_audio_loader(chosen: types.ChosenInlineResult):
     ad_btn = get_ad_button()
     if ad_btn:
         markup.add(ad_btn)
+
+    cached = get_cached_media(f"aud:{url}", title)
+    if cached:
+        file_id, _, cached_title = cached
+        final_title = title or cached_title
+        try:
+            media = types.InputMediaAudio(
+                media=file_id,
+                caption=final_caption,
+                parse_mode="HTML",
+                title=final_title
+            )
+            bot.edit_message_media(media=media, inline_message_id=inline_msg_id, reply_markup=markup)
+            return
+        except Exception:
+            pass
 
     base_path = f"downloads/inl_{int(time.time()*1000)}_{random.randint(100,999)}"
     aud_file = None
@@ -2716,7 +2884,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"OK - Tarona Bot Supabase RAM Turbo Active")
+        self.wfile.write(b"OK - Tarona Bot Supabase RAM 0.1s Active")
 
     def log_message(self, format, *args):
         return
@@ -2765,7 +2933,7 @@ if __name__ == "__main__":
     threading.Thread(target=start_render_web_server, daemon=True).start()
     threading.Thread(target=background_supabase_sync_worker, daemon=True).start()
     threading.Thread(target=background_top_warmer, daemon=True).start()
-    print("🚀 Tarona Bot | Supabase + RAM Turbo + Render ishga tushdi...")
+    print("🚀 Tarona Bot | Supabase + RAM 0.1s + Render ishga tushdi...")
     while True:
         try:
             setup_bot_commands()
