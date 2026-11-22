@@ -652,38 +652,34 @@ def get_ydl_opts(mode: str = "audio", outtmpl: str = None):
                     'player_client': ['web', 'mweb'],
                 }
             },
+            'js_runtimes': {'node': {}},
             'source_address': '0.0.0.0',
             'noplaylist': True,
             'quiet': True,
             'no_warnings': True,
             'nocheckcertificate': True,
-            'retries': 1,
-            'socket_timeout': 8,
-            'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-            }
+            'retries': 3,
+            'socket_timeout': 20,
         }
 
     opts = {
         'ffmpeg_location': FFMPEG_BIN,
         'extractor_args': {
             'youtube': {
-                'player_client': ['android', 'ios', 'web'],
+                'player_client': ['tv', 'android_vr', 'web_safari'],
             }
         },
+        'js_runtimes': {'node': {}},
         'source_address': '0.0.0.0',
         'noplaylist': True,
         'quiet': True,
         'no_warnings': True,
         'nocheckcertificate': True,
-        'retries': 1,
-        'fragment_retries': 1,
-        'socket_timeout': 8,
-        'concurrent_fragment_downloads': 16,
+        'retries': 3,
+        'fragment_retries': 3,
+        'socket_timeout': 20,
+        'concurrent_fragment_downloads': 8,
         'http_chunk_size': 10 * 1024 * 1024,
-        'http_headers': {
-            'User-Agent': 'com.google.android.youtube/19.29.37 (Linux; U; Android 14) gzip',
-        }
     }
     if mode == "audio":
         opts['format'] = 'bestaudio[ext=m4a][abr<=130]/bestaudio[ext=m4a]/bestaudio/best'
@@ -2312,18 +2308,6 @@ def download_file_turbo(url: str, base_path: str, mode: str = "audio"):
             chosen_file = valid_files[0] if valid_files else None
             return chosen_file, info.get('title', 'Media'), info.get('duration', 0)
 
-def _find_fallback_url(query_text: str, failed_url: str):
-    if not query_text:
-        return None
-    try:
-        alt_items = _yt_flat_search(f"ytsearch3:{query_text}", filter_mixes=False)
-        for item in alt_items:
-            if item.get("url") and item["url"] != failed_url:
-                return item["url"]
-    except Exception:
-        pass
-    return None
-
 def send_audio_by_url(
     chat_id: int,
     url: str,
@@ -2400,9 +2384,8 @@ def send_audio_by_url(
             aud_file, title, duration = None, custom_title or "Audio", 0
 
         if not aud_file or not os.path.exists(aud_file):
-            fallback_url = _find_fallback_url(custom_title, active_url)
-            if fallback_url:
-                active_url = fallback_url
+            if custom_title:
+                active_url = f"scsearch1:{custom_title}"
                 try:
                     aud_file, title, duration = download_file_turbo(active_url, base_path + "_fb", mode="audio")
                 except Exception:
