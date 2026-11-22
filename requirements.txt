@@ -1,0 +1,5 @@
+pyTelegramBotAPI==4.23.0
+yt-dlp
+imageio-ffmpeg
+shazamio
+psycopg2-binary
