@@ -688,10 +688,12 @@ def get_ydl_opts(mode: str = "audio", outtmpl: str = None):
     if outtmpl:
         opts['outtmpl'] = outtmpl
         opts['max_filesize'] = 49 * 1024 * 1024
-    if os.path.exists("cookies.txt"):
-        opts['cookiefile'] = "cookies.txt"
-    elif os.path.exists("/etc/secrets/cookies.txt"):
-        opts['cookiefile'] = "/etc/secrets/cookies.txt"
+    src = "cookies.txt" if os.path.exists("cookies.txt") else "/etc/secrets/cookies.txt"
+    if os.path.exists(src):
+        dst = "/tmp/yt_cookies.txt"
+        if not os.path.exists(dst):
+            shutil.copyfile(src, dst)
+        opts['cookiefile'] = dst
     return opts
 
 # ==========================================
